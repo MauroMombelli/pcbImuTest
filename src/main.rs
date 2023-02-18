@@ -39,6 +39,9 @@ static CORE_UPDATE: AtomicU32 = AtomicU32::new(0);
 
 static ASD: AtomicU32 = AtomicU32::new(0);
 
+const READ: u8 = 1 << 7;
+const WRITE: u8 = 0 << 7;
+
 #[embassy_executor::task]
 async fn read_sensors(
     mut spi: Spi<
@@ -47,68 +50,19 @@ async fn read_sensors(
         embassy_stm32::peripherals::DMA1_CH3,
         embassy_stm32::peripherals::DMA1_CH2,
     >,
-    mut acce_cs: Output<'static, embassy_stm32::peripherals::PE5>,
-    mut gyro_cs: Output<'static, embassy_stm32::peripherals::PE4>,
-    mut interrupt: ExtiInput<'static, embassy_stm32::peripherals::PE1>,
+    mut bmi088: Bmi088,
+    //mut gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
+    //mut acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
 ) {
-    gyro_cs.set_high();
-    acce_cs.set_high();
-
     Timer::after(Duration::from_millis(100)).await;
 
-    const READ: u8 = 1 << 7;
-    const WRITE: u8 = 0 << 7;
-    //// STARTUP BMI088
-    // as per DS, BMI088 acce need a CS rising edge
-    // also gyro is in normal mode, acce in suspend.
-    /* WARNING
-        - In case of read operations, the SPI interface of the accelerometer part does not send the
-    requested information directly after the master has send the corresponding register address,
-    but sends a dummy byte first, whose content is not predictable. Only after this dummy byte the
-    desired content is sent
-
-        - multiple read does not require nothing special
-
-    */
-
-    // ACC_CHIP_ID == 0x1E
-    let mut buf: [u8; 2] = [0x1E | READ, 0xFF]; // turn on
-    acce_cs.set_low();
-    spi.blocking_read(&mut buf).ok();
-    acce_cs.set_high();
-
-    // 0x03: ACC_STATUS bit7 == data ready, 6:0 reserved
-
-    // 0x40: ACC_CONF 7:4 badwith, keep default 0x0A 3:0 ODR 0x0B = 800Hz 0x0C = 1600Hz
-
-    // 0x41: ACC_RANGE 1:0 0x00 = +-3g 0x01 +-6g (default)
-
-    // 0x58: INT1_INT2_MAP_DATA bit 6 drdy on INT2, bit 2 drdy on INT1
-
-    // 0x7D: ACC_PWR_CTRL 0x00 off (default) 0x04 on
-    let buf: [u8; 2] = [0x7D | WRITE, 0x04]; // turn on
-    acce_cs.set_low();
-    spi.blocking_write(&buf).ok();
-    acce_cs.set_high();
-
-    // 0x7C: ACC_PWR_CONF 0x00 = active, 0x03 suspend (default)
-    let buf: [u8; 2] = [0x7C | WRITE, 0x00]; // activate
-    acce_cs.set_low();
-    spi.blocking_write(&buf).ok();
-    acce_cs.set_high();
-
-    Timer::after(Duration::from_millis(100)).await;
-    let mut buf: [u8; 2] = [0x1E | READ, 0xFF]; // turn on
-    acce_cs.set_low();
-    spi.blocking_read(&mut buf).ok();
-    acce_cs.set_high();
-    info!("acce WHOAMI {}", buf[1]);
+    bmi088.init(&spi);
 
     // 0x00: GYRO_CHIP_ID = 0x0F
 
-    let mut buf: [u8; 2] = [0x0F | READ, 0xFF]; // turn on
+    let mut buf: [u8; 2] = [0x00 | READ, 0x00]; // turn on
     gyro_cs.set_low();
-    spi.blocking_read(&mut buf).ok();
+    spi.blocking_transfer_in_place(&mut buf).ok();
     gyro_cs.set_high();
     info!("gyro WHOAMI {}", buf[1]);
 
@@ -122,7 +76,7 @@ async fn read_sensors(
 
     loop {
         Timer::after(Duration::from_millis(1)).await;
-        // 0x12 – 0x17: ACC data, MSB_Z, LSB_Z, Y, X
+        // 0x12 – 0x17: ACC data, X, Y, Z
         /*
         Accel_X_int16 = ACC_X_MSB * 256 + ACC_X_LSB
         Accel_Y_int16 = ACC_Y_MSB * 256 + ACC_Y_LSB
@@ -139,15 +93,15 @@ async fn read_sensors(
 
         let data = Data {
             data: [
-                (read[4] as u16 + ((read[5] as u16) << 8)) as i16,
-                (read[6] as u16 + ((read[7] as u16) << 8)) as i16,
-                (read[2] as u16 + ((read[3] as u16) << 8)) as i16,
+                (read[2] as u16 + (read[3] as u16 * 256)) as i16,
+                (read[4] as u16 + (read[5] as u16 * 256)) as i16,
+                (read[6] as u16 + (read[7] as u16 * 256)) as i16,
             ],
         };
         ACCE_UPDATE.fetch_add(1, Ordering::SeqCst);
         DATA_ACCE.signal(data);
 
-        // 0x02 – 0x07: Rate data Z, Y, X
+        // 0x02 – 0x07: Rate data X, Y, Z
         /*
         Rate_X: RATE_X_MSB * 256 + RATE_X_LSB
         Rate_Y: RATE_Y_MSB * 256 + RATE_Y_LSB
@@ -161,9 +115,9 @@ async fn read_sensors(
 
         let data = Data {
             data: [
-                (read[5] as u16 + ((read[6] as u16) << 8)) as i16,
-                (read[1] as u16 + ((read[2] as u16) << 8)) as i16,
-                (read[3] as u16 + ((read[4] as u16) << 8)) as i16,
+                (read[1] as u16 + (read[2] as u16 * 256)) as i16,
+                (read[3] as u16 + (read[4] as u16 * 256)) as i16,
+                (read[5] as u16 + (read[6] as u16 * 256)) as i16,
             ],
         };
         GYRO_UPDATE.fetch_add(1, Ordering::SeqCst);
@@ -299,23 +253,122 @@ async fn core() {
     }
 }
 
+struct Bmi088 {
+    gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
+    acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
+}
+
+impl Bmi088 {
+    fn new(
+        gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
+        acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
+    ) {
+        self.acce_cs = acce_cs;
+        self.gyro_cs = gyro_cs;
+    }
+
+    async fn init<SPI>(&mut spi: SPI) {
+        //// STARTUP BMI088
+        // as per DS, BMI088 acce need a CS rising edge
+        // also gyro is in normal mode, acce in suspend.
+        /* WARNING
+            - In case of read operations, the SPI interface of the accelerometer part does not send the
+        requested information directly after the master has send the corresponding register address,
+        but sends a dummy byte first, whose content is not predictable. Only after this dummy byte the
+        desired content is sent
+
+            - multiple read does not require nothing special
+
+        */
+
+        let buf: [u8; 2] = [0x7E | WRITE, 0xB6]; // reset
+        self.acce_cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.acce_cs.set_high();
+
+        let buf: [u8; 2] = [0x14 | WRITE, 0xB6]; // reset
+        self.gyro_cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.gyro_cs.set_high();
+
+        Timer::after(Duration::from_millis(1)).await;
+
+        // 0x00 ACC_CHIP_ID == 0x1E
+        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
+        self.acce_cs.set_low();
+        spi.blocking_transfer_in_place(&mut buf).ok();
+        self.acce_cs.set_high();
+        info!("acce WHOAMI {}", buf[2]);
+
+        // 0x03: ACC_STATUS bit7 == data ready, 6:0 reserved
+
+        // 0x40: ACC_CONF 7:4 badwith, keep default 0x0A 3:0 ODR 0x0B = 800Hz 0x0C = 1600Hz
+
+        // 0x41: ACC_RANGE 1:0 0x00 = +-3g 0x01 +-6g (default)
+
+        // 0x58: INT1_INT2_MAP_DATA bit 6 drdy on INT2, bit 2 drdy on INT1
+
+        // 0x7C: ACC_PWR_CONF 0x00 = active, 0x03 suspend (default)
+        /*
+            let buf: [u8; 2] = [0x7C | WRITE, 0x00]; // activate
+            acce_cs.set_low();
+            spi.blocking_write(&buf).ok();
+            acce_cs.set_high();
+        */
+        let mut buf: [u8; 3] = [0x7C | READ, 0xFF, 0xFF];
+        self.acce_cs.set_low();
+        spi.blocking_transfer_in_place(&mut buf).ok();
+        self.acce_cs.set_high();
+        info!("acce ACC_PWR_CONF {} should be 0", buf[2]);
+
+        // 0x7D: ACC_PWR_CTRL 0x00 off (default) 0x04 on
+        let buf: [u8; 2] = [0x7D | WRITE, 0x04]; // turn on
+        self.acce_cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.acce_cs.set_high();
+
+        Timer::after(Duration::from_millis(1)).await;
+
+        let mut buf: [u8; 3] = [0x7D | READ, 0xFF, 0xFF];
+        self.acce_cs.set_low();
+        spi.blocking_transfer_in_place(&mut buf).ok();
+        self.acce_cs.set_high();
+        info!("acce ACC_PWR_CTRL {} should be 4", buf[2]);
+
+        Timer::after(Duration::from_millis(100)).await;
+        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
+        self.acce_cs.set_low();
+        spi.blocking_transfer_in_place(&mut buf).ok();
+        self.acce_cs.set_high();
+        info!("acce WHOAMI {}", buf[2]);
+    }
+}
+
+struct Bmi270 {
+    cs: Output<'static, embassy_stm32::peripherals::PB7>,
+}
+
+struct Lsm {
+    cs: Output<'static, embassy_stm32::peripherals::PB6>,
+}
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let mut clockConfigRcc = embassy_stm32::rcc::Config::default();
-    clockConfigRcc.hse = Some(Hertz(8_000_000));
-    clockConfigRcc.bypass_hse = false;
-    clockConfigRcc.sysclk = Some(Hertz(72_000_000));
-    clockConfigRcc.hclk = Some(Hertz(72_000_000));
-    clockConfigRcc.pclk1 = Some(Hertz(36_000_000));
-    clockConfigRcc.pclk2 = Some(Hertz(72_000_000));
-    clockConfigRcc.pll48 = false;
+    let mut clock_config_rcc = embassy_stm32::rcc::Config::default();
+    clock_config_rcc.hse = Some(Hertz(8_000_000));
+    clock_config_rcc.bypass_hse = false;
+    clock_config_rcc.sysclk = Some(Hertz(72_000_000));
+    clock_config_rcc.hclk = Some(Hertz(72_000_000));
+    clock_config_rcc.pclk1 = Some(Hertz(36_000_000));
+    clock_config_rcc.pclk2 = Some(Hertz(72_000_000));
+    clock_config_rcc.pll48 = false;
 
     let mut clockConfig = embassy_stm32::Config::default();
-    clockConfig.rcc = clockConfigRcc;
+    clockConfig.rcc = clock_config_rcc;
     let p = embassy_stm32::init(clockConfig);
     info!("Hello World!");
 
-    let spi = Spi::new(
+    let mut spi = Spi::new(
         p.SPI1,
         p.PA5,
         p.PA7,
@@ -328,18 +381,25 @@ async fn main(spawner: Spawner) {
     //PE3 for onboard sensor
 
     let mut bmi270_cs = Output::new(p.PB7, Level::High, Speed::Low);
-    let mut lsm_cs = Output::new(p.PB6, Level::High, Speed::Low);
-    bmi270_cs.set_high();
-    lsm_cs.set_high();
 
-    let acce_cs = Output::new(p.PE5, Level::High, Speed::Low);
-    let gyro_cs = Output::new(p.PE4, Level::High, Speed::Low);
+    let lsm_cs = Output::new(p.PB6, Level::High, Speed::Low);
+
+    /*
+        let bmi088_acce_cs = Output::new(p.PB5, Level::High, Speed::Low);
+        let bmi088_gyro_cs = Output::new(p.PB4, Level::High, Speed::Low);
+    */
+    let bmi088 = Bmi088::new(
+        Output::new(p.PB4, Level::High, Speed::Low),
+        Output::new(p.PB5, Level::High, Speed::Low),
+    );
+
+    // this is the onboard gyro
+    let _gyro_nss = Output::new(p.PE3, Level::High, Speed::Low);
     let gyro_interrupt = Input::new(p.PE1, Pull::Down);
     let gyro_interrupt = ExtiInput::new(gyro_interrupt, p.EXTI1);
 
-    spawner
-        .spawn(read_sensors(spi, acce_cs, gyro_cs, gyro_interrupt))
-        .unwrap();
+    spawner.spawn(read_sensors(spi, bmi088)).unwrap();
+    // spawner.spawn(read_gyro(spi, _gyro_nss, gyro_interrupt)).unwrap();
     /*
         let irq = interrupt::take!(I2C1_EV);
         let i2c = I2c::new(
