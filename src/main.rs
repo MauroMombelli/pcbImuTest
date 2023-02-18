@@ -1,22 +1,28 @@
 #![no_std]
 #![no_main]
-
-// monitor arm semihosting enable
+#![feature(type_alias_impl_trait)]
 
 use core::sync::atomic::{AtomicU32, Ordering};
-use cortex_m;
-use cortex_m_rt::{entry, exception};
 
-use cortex_m_semihosting::hprintln;
+use defmt::*;
+use embassy_executor::Spawner;
+use embassy_stm32::exti::ExtiInput;
+use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
+use embassy_stm32::i2c::I2c;
+use embassy_stm32::interrupt;
+use embassy_stm32::spi::Spi;
+use embassy_stm32::time::Hertz;
+use embassy_sync::blocking_mutex::raw::{CriticalSectionRawMutex, ThreadModeRawMutex};
+use embassy_sync::signal::Signal;
+use embassy_time::{Duration, Instant, Timer};
+use {defmt_rtt as _, panic_probe as _};
 
-use stm32_hal2::{
-    clocks::Clocks,
-    gpio::{Pin, Port, PinMode, OutputType},
-    i2c::I2c,
-    spi::Spi,
-    pac
-};
-use stm32_hal2::clocks::*;
+struct Data {
+    data: [i16; 3],
+}
+
+static DATA_ACCE: Signal<ThreadModeRawMutex, Data> = Signal::new();
+static DATA_GYRO: Signal<ThreadModeRawMutex, Data> = Signal::new();
 
 // E13 -> LED
 
@@ -27,272 +33,342 @@ use stm32_hal2::clocks::*;
 // A5 A6 A7 -> SPI
 // E3 -> CS
 
-static SYSTICK_RELOAD: AtomicU32 = AtomicU32::new(0);
+static GYRO_UPDATE: AtomicU32 = AtomicU32::new(0);
+static ACCE_UPDATE: AtomicU32 = AtomicU32::new(0);
+static CORE_UPDATE: AtomicU32 = AtomicU32::new(0);
 
-#[entry]
-fn main() -> ! {
-    // Set up CPU peripherals
-    let mut cp = cortex_m::Peripherals::take().unwrap();
+static ASD: AtomicU32 = AtomicU32::new(0);
 
-    // Set up microcontroller peripherals
-    let dp = pac::Peripherals::take().unwrap();
+#[embassy_executor::task]
+async fn read_sensors(
+    mut spi: Spi<
+        'static,
+        embassy_stm32::peripherals::SPI1,
+        embassy_stm32::peripherals::DMA1_CH3,
+        embassy_stm32::peripherals::DMA1_CH2,
+    >,
+    mut acce_cs: Output<'static, embassy_stm32::peripherals::PE5>,
+    mut gyro_cs: Output<'static, embassy_stm32::peripherals::PE4>,
+    mut interrupt: ExtiInput<'static, embassy_stm32::peripherals::PE1>,
+) {
+    gyro_cs.set_high();
+    acce_cs.set_high();
 
-    let clock_cfg = Clocks{
-        input_src: InputSrc::Pll(PllSrc::Hse(8_000_000)), //8MHz external clock
-        prediv: Prediv::Div1,
-        pll_mul: PllMul::Mul9,
-        usb_pre: UsbPrescaler::Div1_5,
-        hclk_prescaler: HclkPrescaler::Div1,
-        apb1_prescaler: ApbPrescaler::Div2,
-        apb2_prescaler: ApbPrescaler::Div1,
-        hse_bypass: false,
-        security_system: false,
-    };
+    Timer::after(Duration::from_millis(100)).await;
 
-    //let clock_cfg = Clocks::default();
-    clock_cfg.setup().unwrap();
+    const READ: u8 = 1 << 7;
+    const WRITE: u8 = 0 << 7;
+    //// STARTUP BMI088
+    // as per DS, BMI088 acce need a CS rising edge
+    // also gyro is in normal mode, acce in suspend.
+    /* WARNING
+        - In case of read operations, the SPI interface of the accelerometer part does not send the
+    requested information directly after the master has send the corresponding register address,
+    but sends a dummy byte first, whose content is not predictable. Only after this dummy byte the
+    desired content is sent
 
-    cp.SYST.set_clock_source(cortex_m::peripheral::syst::SystClkSource::External);
-    cp.SYST.set_reload(8_000-1); //1 isr == 1ms
-    cp.SYST.clear_current();
-    cp.SYST.enable_counter();
-    cp.SYST.enable_interrupt();
+        - multiple read does not require nothing special
 
-    let mut led = Pin::new(Port::E, 13, PinMode::Output);
-    led.set_high();
+    */
 
-    /**************************************/
+    // ACC_CHIP_ID == 0x1E
+    let mut buf: [u8; 2] = [0x1E | READ, 0xFF]; // turn on
+    acce_cs.set_low();
+    spi.blocking_read(&mut buf).ok();
+    acce_cs.set_high();
 
-    let mut scl = Pin::new(Port::B, 6, PinMode::Alt(4));
-    scl.output_type(OutputType::OpenDrain);
-    //scl.set_high();
+    // 0x03: ACC_STATUS bit7 == data ready, 6:0 reserved
 
-    let mut sda = Pin::new(Port::B, 7, PinMode::Alt(4));
-    sda.output_type(OutputType::OpenDrain);
-    //sda.set_high();
+    // 0x40: ACC_CONF 7:4 badwith, keep default 0x0A 3:0 ODR 0x0B = 800Hz 0x0C = 1600Hz
 
-    let i2c_cfg = stm32_hal2::i2c::I2cConfig {
-        speed: stm32_hal2::i2c::I2cSpeed::Fast400K, // Set to Fast mode, at 400Khz.
-        nostretch: false,
-        noise_filter: stm32_hal2::i2c::NoiseFilter::Analog,
-        ..Default::default()
-    };
+    // 0x41: ACC_RANGE 1:0 0x00 = +-3g 0x01 +-6g (default)
 
-    let mut i2c = I2c::new(dp.I2C1, i2c_cfg, &clock_cfg);
+    // 0x58: INT1_INT2_MAP_DATA bit 6 drdy on INT2, bit 2 drdy on INT1
 
-    /**************************************/
+    // 0x7D: ACC_PWR_CTRL 0x00 off (default) 0x04 on
+    let buf: [u8; 2] = [0x7D | WRITE, 0x04]; // turn on
+    acce_cs.set_low();
+    spi.blocking_write(&buf).ok();
+    acce_cs.set_high();
 
-    let mut _sck = Pin::new(Port::A, 5, PinMode::Alt(5));
-    let mut _miso = Pin::new(Port::A, 6, PinMode::Alt(5));
-    let mut _mosi = Pin::new(Port::A, 7, PinMode::Alt(5));
-    let mut nss = Pin::new(Port::E, 3, PinMode::Output);
+    // 0x7C: ACC_PWR_CONF 0x00 = active, 0x03 suspend (default)
+    let buf: [u8; 2] = [0x7C | WRITE, 0x00]; // activate
+    acce_cs.set_low();
+    spi.blocking_write(&buf).ok();
+    acce_cs.set_high();
+
+    Timer::after(Duration::from_millis(100)).await;
+    let mut buf: [u8; 2] = [0x1E | READ, 0xFF]; // turn on
+    acce_cs.set_low();
+    spi.blocking_read(&mut buf).ok();
+    acce_cs.set_high();
+    info!("acce WHOAMI {}", buf[1]);
+
+    // 0x00: GYRO_CHIP_ID = 0x0F
+
+    let mut buf: [u8; 2] = [0x0F | READ, 0xFF]; // turn on
+    gyro_cs.set_low();
+    spi.blocking_read(&mut buf).ok();
+    gyro_cs.set_high();
+    info!("gyro WHOAMI {}", buf[1]);
+
+    // 0x02 – 0x07: Rate data
+
+    // 0x10: GYRO_BANDWIDTH 0x00 2000Hz 532Hz BW (default) 0x02 1000Hz 116Hz BW
+
+    // 0x15: GYRO_INT_CTRL bit7 enable data ready int
+
+    // 0x0F: GYRO_RANGE 0x00 +-2000deg/s (default) 0x02 = +-500 deg/s
+
+    loop {
+        Timer::after(Duration::from_millis(1)).await;
+        // 0x12 – 0x17: ACC data, MSB_Z, LSB_Z, Y, X
+        /*
+        Accel_X_int16 = ACC_X_MSB * 256 + ACC_X_LSB
+        Accel_Y_int16 = ACC_Y_MSB * 256 + ACC_Y_LSB
+        Accel_Z_int16 = ACC_Z_MSB * 256 + ACC_Z_LSB
+
+        Accel_X_in_mg = Accel_X_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+        Accel_Y_in_mg = Accel_Y_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+        Accel_Z_in_mg = Accel_Z_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+        */
+        let mut read: [u8; 8] = [0x12 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        acce_cs.set_low();
+        spi.blocking_transfer_in_place(&mut read).ok();
+        acce_cs.set_high();
+
+        let data = Data {
+            data: [
+                (read[4] as u16 + ((read[5] as u16) << 8)) as i16,
+                (read[6] as u16 + ((read[7] as u16) << 8)) as i16,
+                (read[2] as u16 + ((read[3] as u16) << 8)) as i16,
+            ],
+        };
+        ACCE_UPDATE.fetch_add(1, Ordering::SeqCst);
+        DATA_ACCE.signal(data);
+
+        // 0x02 – 0x07: Rate data Z, Y, X
+        /*
+        Rate_X: RATE_X_MSB * 256 + RATE_X_LSB
+        Rate_Y: RATE_Y_MSB * 256 + RATE_Y_LSB
+        Rate_Z: RATE_Z_MSB * 256 + RATE_Z_LSB
+         */
+
+        let mut read: [u8; 7] = [0x02 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        gyro_cs.set_low();
+        spi.blocking_transfer_in_place(&mut read).ok();
+        gyro_cs.set_high();
+
+        let data = Data {
+            data: [
+                (read[5] as u16 + ((read[6] as u16) << 8)) as i16,
+                (read[1] as u16 + ((read[2] as u16) << 8)) as i16,
+                (read[3] as u16 + ((read[4] as u16) << 8)) as i16,
+            ],
+        };
+        GYRO_UPDATE.fetch_add(1, Ordering::SeqCst);
+        DATA_GYRO.signal(data);
+    }
+}
+
+#[embassy_executor::task]
+async fn read_gyro(
+    mut spi: Spi<
+        'static,
+        embassy_stm32::peripherals::SPI1,
+        embassy_stm32::peripherals::DMA1_CH3,
+        embassy_stm32::peripherals::DMA1_CH2,
+    >,
+    mut nss: Output<'static, embassy_stm32::peripherals::PE3>,
+    mut interrupt: ExtiInput<'static, embassy_stm32::peripherals::PE1>,
+) {
     nss.set_high();
-
-    let spi_cfg = stm32_hal2::spi::SpiConfig {
-        mode: stm32_hal2::spi::SpiMode::mode3(),
-        comm_mode: stm32_hal2::spi::SpiCommMode::FullDuplex,
-        slave_select: stm32_hal2::spi::SlaveSelect::Software,
-        data_size: stm32_hal2::spi::DataSize::D8,
-        fifo_reception_thresh: stm32_hal2::spi::ReceptionThresh::D8,
-    };
-
-    let mut spi = Spi::new(dp.SPI1, spi_cfg, stm32_hal2::spi::BaudRate::Div2);
 
     const READ: u8 = 1 << 7;
     const WRITE: u8 = 0 << 7;
     const MULTI: u8 = 1 << 6;
     const SINGLE: u8 = 0 << 6;
 
-    /**************************************/
-
-    let acce_addr = 0x19;
-    //accelerometer, enable all axis
-
-    let i2c_acce_enable_all_axis: [u8; 2] = [0x20, 0x77];
-    i2c.write(acce_addr, &i2c_acce_enable_all_axis).ok();
-
-    //reset?!
-
     nss.set_low();
     let mut buf_id_spi: [u8; 2] = [0x0F | SINGLE | READ, 0x00];
-    spi.transfer(&mut buf_id_spi).ok();
+    spi.blocking_transfer_in_place(&mut buf_id_spi).ok();
     nss.set_high();
 
     nss.set_low();
     let spi_gyro_enable_all: [u8; 2] = [0x20 | SINGLE | WRITE, 0xFF]; // 760Hz, 100 cut off, enable all
-    spi.write(&spi_gyro_enable_all).ok();
+    spi.blocking_write(&spi_gyro_enable_all).ok();
+    nss.set_high();
+
+    nss.set_low();
+    let spi_gyro_enable_all: [u8; 2] = [0x22 | SINGLE | WRITE, 0x08]; // enable data ready on DRDY/INT2
+    spi.blocking_write(&spi_gyro_enable_all).ok();
     nss.set_high();
 
     nss.set_low();
     let spi_gyro_enable_all: [u8; 2] = [0x23 | SINGLE | WRITE, 0x10]; // continoous update, LSB, 500dps, 4 wire spi
-    spi.write(&spi_gyro_enable_all).ok();
+    spi.blocking_write(&spi_gyro_enable_all).ok();
     nss.set_high();
 
+    loop {
+        interrupt.wait_for_high().await;
+        let write = [0x28 | MULTI | READ, 0, 0, 0, 0, 0, 0];
+        let mut read = [0; 7];
+        nss.set_low();
+        spi.transfer(&mut read, &write).await.ok();
+        nss.set_high();
 
-    //let mut answer: [u8; 6] = [0; 6];
-    let mut counter = 0;
-    let mut last_value = 0;
+        GYRO_UPDATE.fetch_add(1, Ordering::SeqCst);
 
-    enum SpiState {
-        CsLow,
-        REQUEST,
-        ANSWER,
-        CsHigh,
+        let data = Data {
+            data: [
+                (read[1] as u16 + ((read[2] as u16) << 8)) as i16,
+                (read[3] as u16 + ((read[4] as u16) << 8)) as i16,
+                (read[5] as u16 + ((read[6] as u16) << 8)) as i16,
+            ],
+        };
+
+        DATA_GYRO.signal(data);
     }
-    let mut index = 0;
-    let mut buf_read_spi:[u8; 7] = [0; 7];
+}
 
-    let mut spi_state : SpiState = SpiState::CsLow;
+#[embassy_executor::task]
+async fn read_acce(
+    mut i2c: I2c<
+        'static,
+        embassy_stm32::peripherals::I2C1,
+        embassy_stm32::peripherals::DMA1_CH6,
+        embassy_stm32::peripherals::DMA1_CH7,
+    >,
+    mut interrupt: ExtiInput<'static, embassy_stm32::peripherals::PE4>,
+) {
+    let addr = 0x19;
+    //accelerometer, enable all axis, low power mode, 400Hz
+    let buf = [0x20, 0x77];
+    i2c.blocking_write(addr, &buf);
 
-    enum I2cState {
-        WriteAddr,
-        WriteReg,
-        RESTART,
-        READ,
+    let buf = [0x22, 0x10]; //drdy int1
+    i2c.blocking_write(addr, &buf);
+
+    let request: [u8; 1] = [0x28 + 0x80]; // 0x80 mean multiread
+    let mut read: [u8; 6] = [0; 6];
+    loop {
+        interrupt.wait_for_high().await;
+        //i2c.write_read(addr, &request, &mut read).await.ok();
+        let acce_read_future = i2c.write_read(addr, &request, &mut read);
+
+        if embassy_time::with_timeout(Duration::from_secs(1), acce_read_future)
+            .await
+            .is_err()
+        {
+            info!("acce read timeout");
+        }
+        ACCE_UPDATE.fetch_add(1, Ordering::SeqCst);
+
+        let data = Data {
+            data: [
+                (read[0] as u16 + ((read[1] as u16) << 8)) as i16,
+                (read[2] as u16 + ((read[3] as u16) << 8)) as i16,
+                (read[4] as u16 + ((read[5] as u16) << 8)) as i16,
+            ],
+        };
+
+        DATA_ACCE.signal(data);
     }
+}
 
-    let mut i2c_state = I2cState::WriteAddr;
-    let mut buf_read_i2c: [u8; 6] = [0; 6];
-    let mut index_i2c = 0;
+#[embassy_executor::task]
+async fn core() {
+    let mut time_start_next_loop = Instant::now();
+    let loop_desired_duration = Duration::from_millis(1);
+    loop {
+        if DATA_ACCE.signaled() && DATA_GYRO.signaled() {
+            let acce = DATA_ACCE.wait().await;
+            let gyro = DATA_GYRO.wait().await;
 
-    let mut gyro: [i16; 3] = [0; 3];
-    let mut acce: [i16; 3] = [0; 3];
+            if ASD.swap(0, Ordering::SeqCst) == 1 {
+                info!("gyro: ({},{},{})", gyro.data[0], gyro.data[1], gyro.data[2]);
+                info!("acce: ({},{},{})", acce.data[0], acce.data[1], acce.data[2]);
+            }
+        }
+
+        CORE_UPDATE.fetch_add(1, Ordering::SeqCst);
+
+        time_start_next_loop += loop_desired_duration;
+        Timer::at(time_start_next_loop).await;
+        //embassy_futures::yield_now().await;
+    }
+}
+
+#[embassy_executor::main]
+async fn main(spawner: Spawner) {
+    let mut clockConfigRcc = embassy_stm32::rcc::Config::default();
+    clockConfigRcc.hse = Some(Hertz(8_000_000));
+    clockConfigRcc.bypass_hse = false;
+    clockConfigRcc.sysclk = Some(Hertz(72_000_000));
+    clockConfigRcc.hclk = Some(Hertz(72_000_000));
+    clockConfigRcc.pclk1 = Some(Hertz(36_000_000));
+    clockConfigRcc.pclk2 = Some(Hertz(72_000_000));
+    clockConfigRcc.pll48 = false;
+
+    let mut clockConfig = embassy_stm32::Config::default();
+    clockConfig.rcc = clockConfigRcc;
+    let p = embassy_stm32::init(clockConfig);
+    info!("Hello World!");
+
+    let spi = Spi::new(
+        p.SPI1,
+        p.PA5,
+        p.PA7,
+        p.PA6,
+        p.DMA1_CH3,
+        p.DMA1_CH2,
+        Hertz(10_000_000),
+        embassy_stm32::spi::Config::default(),
+    );
+    //PE3 for onboard sensor
+
+    let mut bmi270_cs = Output::new(p.PB7, Level::High, Speed::Low);
+    let mut lsm_cs = Output::new(p.PB6, Level::High, Speed::Low);
+    bmi270_cs.set_high();
+    lsm_cs.set_high();
+
+    let acce_cs = Output::new(p.PE5, Level::High, Speed::Low);
+    let gyro_cs = Output::new(p.PE4, Level::High, Speed::Low);
+    let gyro_interrupt = Input::new(p.PE1, Pull::Down);
+    let gyro_interrupt = ExtiInput::new(gyro_interrupt, p.EXTI1);
+
+    spawner
+        .spawn(read_sensors(spi, acce_cs, gyro_cs, gyro_interrupt))
+        .unwrap();
+    /*
+        let irq = interrupt::take!(I2C1_EV);
+        let i2c = I2c::new(
+            p.I2C1,
+            p.PB6,
+            p.PB7,
+            irq,
+            p.DMA1_CH6,
+            p.DMA1_CH7,
+            Hertz(300_000),
+            Default::default(),
+        );
+    */
+    //let acce_interrupt = Input::new(p.PE4, Pull::Down);
+    //let acce_interrupt = ExtiInput::new(acce_interrupt, p.EXTI4);
+
+    //spawner.spawn(read_acce(i2c, acce_interrupt)).unwrap();
+
+    spawner.spawn(core()).unwrap();
 
     loop {
-        counter+=1;
-
-        match i2c_state{
-            I2cState::WriteAddr => {
-                if i2c.regs.cr2.read().start().bit_is_clear(){
-                    i2c.regs.cr2.write(|w| {
-                        unsafe {
-                            // Addressing mode (7-bit or 10-bit): ADD10
-                            w.add10().clear_bit();
-                            // Slave address to be sent: SADD[9:0]
-                            // SADD0: "This bit is don’t care"
-                            // SADD[7:1]: "These bits should be written with the 7-bit slave address to be sent"
-                            w.sadd().bits((acce_addr << 1) as u16);
-                            // Transfer direction: RD_WRN
-                            w.rd_wrn().clear_bit(); // write
-                                                    // The number of bytes to be transferred: NBYTES[7:0]. If the number of bytes is equal to
-                                                    // or greater than 255 bytes, NBYTES[7:0] must initially be filled with 0xFF.
-                            w.nbytes().bits(1);
-                            w.autoend().clear_bit(); // software end mode
-                                                    // The user must then set the START bit in I2C_CR2 register. Changing all the above bits is
-                                                    // not allowed when START bit is set.
-                                                    // When the SMBus master wants to transmit the PEC, the PECBYTE bit must be set and the
-                                                    // number of bytes must be programmed in the NBYTES[7:0] field, before setting the START
-                                                    // bit. In this case the total number of TXIS interrupts is NBYTES-1. So if the PECBYTE bit is
-                                                    // set when NBYTES=0x1, the content of the I2C_PECR register is automatically transmitted.
-                                                    // If the SMBus master wants to send a STOP condition after the PEC, automatic end mode
-                                                    // must be selected (AUTOEND=1). In this case, the STOP condition automatically follows the
-                                                    // PEC transmission.
-                            w.pecbyte().clear_bit();
-                            w.start().set_bit()
-                        }
-                    });
-                    i2c_state = I2cState::WriteReg;
-                }
-            },
-            I2cState::WriteReg => {
-                if i2c.regs.isr.read().txis().bit(){
-                    i2c.regs.txdr.write(|w| unsafe { w.txdata().bits(0x28 + 0x80) }); // 0x80 mean multiread, 0x28 is the address
-                    i2c_state = I2cState::RESTART;
-                }
-            },
-            I2cState::RESTART => {
-                if i2c.regs.isr.read().tc().bit(){
-                    i2c.regs.cr2.write(|w| {
-                        unsafe {
-                            w.add10().clear_bit();
-                            w.sadd().bits((acce_addr << 1) as u16);
-                            w.rd_wrn().set_bit(); // read
-                            w.nbytes().bits(6);
-                            w.autoend().set_bit(); // automatic end mode
-                                                   // When the SMBus master wants to receive the PEC followed by a STOP at the end of the
-                                                   // transfer, automatic end mode can be selected (AUTOEND=1). The PECBYTE bit must be
-                                                   // set and the slave address must be programmed, before setting the START bit. In this case,
-                                                   // after NBYTES-1 data have been received, the next received byte is automatically checked
-                                                   // versus the I2C_PECR register content. A NACK response is given to the PEC byte, followed
-                                                   // by a STOP condition.
-                            w.pecbyte().clear_bit();
-                            w.start().set_bit()
-                        }
-                    });
-                    i2c_state = I2cState::READ;
-                    index_i2c = 0;
-                }
-            }
-            I2cState::READ => {
-                if i2c.regs.isr.read().rxne().bit(){
-                    buf_read_i2c[index_i2c] = i2c.regs.rxdr.read().rxdata().bits();
-                    index_i2c += 1;
-                    if index_i2c >= buf_read_i2c.len(){
-                        acce[0] = (buf_read_i2c[0] as u16 + ((buf_read_i2c[1] as u16) << 8)) as i16;
-                        acce[1] = (buf_read_i2c[2] as u16 + ((buf_read_i2c[3] as u16) << 8)) as i16;
-                        acce[2] = (buf_read_i2c[4] as u16 + ((buf_read_i2c[5] as u16) << 8)) as i16;
-                        i2c_state = I2cState::WriteAddr;
-                    }
-                }
-            }
-        }
-
-        match spi_state{
-            SpiState::CsLow => {
-                nss.set_low();
-                spi_state = SpiState::REQUEST;
-            },
-            SpiState::REQUEST => {
-                //this should end up in the fifo
-                buf_read_spi = [0x28 | MULTI | READ, 0, 0, 0, 0, 0, 0];
-                spi_state = SpiState::ANSWER;
-                spi.write_one(buf_read_spi[index]);
-            },
-            SpiState::ANSWER => {
-                let status_spi = spi.regs.sr.read();
-                if status_spi.rxne().bit() {
-                    buf_read_spi[index] = spi.read().expect("val");
-                    index += 1;
-
-                    if index >= buf_read_spi.len(){
-                        gyro[0] = (buf_read_spi[1] as u16 + ((buf_read_spi[2] as u16) << 8)) as i16;
-                        gyro[1] = (buf_read_spi[3] as u16 + ((buf_read_spi[4] as u16) << 8)) as i16;
-                        gyro[2] = (buf_read_spi[5] as u16 + ((buf_read_spi[6] as u16) << 8)) as i16;
-                        index = 0;
-                        spi_state = SpiState::CsHigh;
-                    }else{
-                        spi.write_one(buf_read_spi[index]);
-                    }
-                }
-            },
-            SpiState::CsHigh => {
-                nss.set_high();
-                spi_state = SpiState::CsLow;
-            },
-        }
-
-        let value = SYSTICK_RELOAD.load(Ordering::SeqCst);
-        if value - last_value >= 1000 { // every second
-            last_value = value;
-
-            hprintln!("loops/s: {}, time: {} ms", counter, value);  // 2421 loop SPI ONLY, 66490 SPI + I2C
-            hprintln!("gyro: {:?} acce: {:?}", gyro, acce);
-            counter = 0;
-
-            //toggle led
-            if led.is_high(){led.set_low()}else{led.set_high()}
-        }
-
-
+        Timer::after(Duration::from_secs(1)).await;
+        let gyro_update = GYRO_UPDATE.swap(0, Ordering::SeqCst);
+        let acce_update = ACCE_UPDATE.swap(0, Ordering::SeqCst);
+        let core_update = CORE_UPDATE.swap(0, Ordering::SeqCst);
+        info!(
+            "gyro/s: {} acce/s: {} core/s: {}",
+            gyro_update, acce_update, core_update
+        );
+        ASD.store(1, Ordering::SeqCst);
     }
-}
-
-#[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
-
-#[exception]
-fn SysTick() -> () {
-    SYSTICK_RELOAD.fetch_add(1, Ordering::SeqCst);
 }
