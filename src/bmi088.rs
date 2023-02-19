@@ -38,6 +38,9 @@ impl Bmi088 {
 
         */
 
+        self.acce_cs.set_low();
+        self.acce_cs.set_high();
+
         let buf: [u8; 2] = [0x7E | WRITE, 0xB6]; // reset
         self.acce_cs.set_low();
         spi.blocking_write(&buf).ok();
