@@ -1,4 +1,4 @@
-use defmt::info;
+use defmt::*;
 use embassy_stm32::gpio::Output;
 use embassy_stm32::spi::{Instance, Spi};
 use embassy_time::{Duration, Instant, Timer};
@@ -12,7 +12,7 @@ pub struct Bmi270 {
     cs: Output<'static, embassy_stm32::peripherals::PB7>,
 }
 
-const bmi270_config_file: [u08; 30] = [
+const BMI270_CONFIG_FILE: [u8; 8193] = [
     0x5E | WRITE,
     0xc8,
     0x2e,
@@ -8230,36 +8230,36 @@ impl Bmi270 {
         self.cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.cs.set_high();
-        info!("bmi270 WHOAMI {} (0x24)", buf[2]);
+        info!("bmi270 WHOAMI {} (36)", buf[2]);
 
         let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF];
         self.cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.cs.set_high();
-        info!("bmi270 WHOAMI {} (0x24)", buf[2]);
+        info!("bmi270 WHOAMI {} (36)", buf[2]);
 
         //// init sequence as per page 18
 
         let buf: [u8; 2] = [0x7C | WRITE, 0x00];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         Timer::after(Duration::from_millis(1)).await;
 
         let buf: [u8; 2] = [0x59 | WRITE, 0x00];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
-        self.acce_cs.set_low();
-        spi.blocking_write(&bmi270_config_file).ok();
-        self.acce_cs.set_high();
+        self.cs.set_low();
+        spi.blocking_write(&BMI270_CONFIG_FILE).ok();
+        self.cs.set_high();
 
         let buf: [u8; 2] = [0x59 | WRITE, 0x01];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         Timer::after(Duration::from_millis(20)).await;
 
@@ -8270,31 +8270,31 @@ impl Bmi270 {
         info!("bmi270 init status {} (0x01)", buf[2]);
 
         let buf: [u8; 2] = [0x7D | WRITE, 0x0E];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         let buf: [u8; 2] = [0x40 | WRITE, 0xA8];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         let buf: [u8; 2] = [0x42 | WRITE, 0xE9];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         let buf: [u8; 2] = [0x7C | WRITE, 0x02];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_write(&buf).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
     }
 
     pub async fn read_acce<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
         let mut read: [u8; 8] = [0x0C | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        self.acce_cs.set_low();
+        self.cs.set_low();
         spi.blocking_transfer_in_place(&mut read).ok();
-        self.acce_cs.set_high();
+        self.cs.set_high();
 
         Data {
             data: [
@@ -8307,9 +8307,9 @@ impl Bmi270 {
 
     pub async fn read_gyro<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
         let mut read: [u8; 8] = [0x12 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        self.gyro_cs.set_low();
+        self.cs.set_low();
         spi.blocking_transfer_in_place(&mut read).ok();
-        self.gyro_cs.set_high();
+        self.cs.set_high();
 
         Data {
             data: [

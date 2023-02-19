@@ -18,10 +18,14 @@ use embassy_time::{Duration, Instant, Timer};
 use {defmt_rtt as _, panic_probe as _};
 
 mod bmi088;
+mod bmi270;
 mod data;
+mod lsm6dsr;
 
 use bmi088::Bmi088;
+use bmi270::Bmi270;
 use data::Data;
+use lsm6dsr::Lsm6;
 
 static DATA_ACCE: Signal<ThreadModeRawMutex, Data> = Signal::new();
 static DATA_GYRO: Signal<ThreadModeRawMutex, Data> = Signal::new();
@@ -50,19 +54,25 @@ async fn read_sensors(
         embassy_stm32::peripherals::DMA1_CH2,
     >,
     mut bmi088: Bmi088,
+    mut bmi270: Bmi270,
+    mut lsm6: Lsm6,
     //mut gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
     //mut acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
 ) {
-    bmi088.init(&mut spi);
+    info!("INIT");
+    bmi088.init(&mut spi).await;
+    bmi270.init(&mut spi).await;
+    lsm6.init(&mut spi).await;
 
+    info!("LOOP");
     loop {
         Timer::after(Duration::from_millis(1)).await;
 
-        let data = bmi088.read_acce(&mut spi).await;
+        let data = lsm6.read_acce(&mut spi).await;
         ACCE_UPDATE.fetch_add(1, Ordering::SeqCst);
         DATA_ACCE.signal(data);
 
-        let data = bmi088.read_gyro(&mut spi).await;
+        let data = lsm6.read_gyro(&mut spi).await;
 
         GYRO_UPDATE.fetch_add(1, Ordering::SeqCst);
         DATA_GYRO.signal(data);
@@ -197,10 +207,6 @@ async fn core() {
     }
 }
 
-struct Lsm {
-    cs: Output<'static, embassy_stm32::peripherals::PB6>,
-}
-
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let mut clock_config_rcc = embassy_stm32::rcc::Config::default();
@@ -212,12 +218,12 @@ async fn main(spawner: Spawner) {
     clock_config_rcc.pclk2 = Some(Hertz(72_000_000));
     clock_config_rcc.pll48 = false;
 
-    let mut clockConfig = embassy_stm32::Config::default();
-    clockConfig.rcc = clock_config_rcc;
-    let p = embassy_stm32::init(clockConfig);
+    let mut clock_config = embassy_stm32::Config::default();
+    clock_config.rcc = clock_config_rcc;
+    let p = embassy_stm32::init(clock_config);
     info!("Hello World!");
 
-    let mut spi = Spi::new(
+    let spi = Spi::new(
         p.SPI1,
         p.PA5,
         p.PA7,
@@ -229,14 +235,10 @@ async fn main(spawner: Spawner) {
     );
     //PE3 for onboard sensor
 
-    let mut bmi270_cs = Output::new(p.PB7, Level::High, Speed::Low);
+    let bmi270 = Bmi270::new(Output::new(p.PB7, Level::High, Speed::Low));
 
-    let lsm_cs = Output::new(p.PB6, Level::High, Speed::Low);
+    let lsm6ds = Lsm6::new(Output::new(p.PB6, Level::High, Speed::Low));
 
-    /*
-        let bmi088_acce_cs = Output::new(p.PB5, Level::High, Speed::Low);
-        let bmi088_gyro_cs = Output::new(p.PB4, Level::High, Speed::Low);
-    */
     let bmi088 = Bmi088::new(
         Output::new(p.PB4, Level::High, Speed::Low),
         Output::new(p.PB5, Level::High, Speed::Low),
@@ -247,7 +249,7 @@ async fn main(spawner: Spawner) {
     let gyro_interrupt = Input::new(p.PE1, Pull::Down);
     let gyro_interrupt = ExtiInput::new(gyro_interrupt, p.EXTI1);
 
-    spawner.spawn(read_sensors(spi, bmi088)).unwrap();
+    spawner.spawn(read_sensors(spi, bmi088, bmi270, lsm6ds)).unwrap();
     // spawner.spawn(read_gyro(spi, _gyro_nss, gyro_interrupt)).unwrap();
     /*
         let irq = interrupt::take!(I2C1_EV);

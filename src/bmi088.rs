@@ -1,4 +1,4 @@
-use defmt::info;
+use defmt::*;
 use embassy_stm32::gpio::Output;
 use embassy_stm32::spi::{Instance, Spi};
 use embassy_time::{Duration, Instant, Timer};
@@ -53,12 +53,15 @@ impl Bmi088 {
 
         Timer::after(Duration::from_millis(1)).await;
 
+        self.acce_cs.set_low();
+        self.acce_cs.set_high();
+
         // 0x00 ACC_CHIP_ID == 0x1E
         let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
-        info!("acce WHOAMI {}", buf[2]);
+        info!("acce WHOAMI {} (30)", buf[2]);
 
         // 0x03: ACC_STATUS bit7 == data ready, 6:0 reserved
 
@@ -79,7 +82,7 @@ impl Bmi088 {
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
-        info!("acce ACC_PWR_CONF {} should be 0", buf[2]);
+        info!("acce ACC_PWR_CONF {} (0)", buf[2]);
 
         // 0x7D: ACC_PWR_CTRL 0x00 off (default) 0x04 on
         let buf: [u8; 2] = [0x7D | WRITE, 0x04]; // turn on
@@ -93,14 +96,14 @@ impl Bmi088 {
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
-        info!("acce ACC_PWR_CTRL {} should be 4", buf[2]);
+        info!("acce ACC_PWR_CTRL {} (4)", buf[2]);
 
         Timer::after(Duration::from_millis(100)).await;
         let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
-        info!("acce WHOAMI {}", buf[2]);
+        info!("acce WHOAMI {} (30)", buf[2]);
 
         Timer::after(Duration::from_millis(100)).await;
 
@@ -110,7 +113,7 @@ impl Bmi088 {
         self.gyro_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.gyro_cs.set_high();
-        info!("gyro WHOAMI {}", buf[1]);
+        info!("gyro WHOAMI {} (15)", buf[1]);
 
         // 0x02 – 0x07: Rate data
 
