@@ -60,6 +60,32 @@ async fn read_sensors(
     mut bmi270: Bmi270,
     mut lsm6: Lsm6,
 ) {
+    /*
+    bmi088
+    acce:
+    range g: 3 6 12 24
+    odr Hz: 12.5 25 50 100 200 400 800 1600
+    gyro:
+    range deg/s: 125 250 500 1000 2000
+    odr Hz: 100 200 400 1000 2000
+
+    bmi270
+    acce:
+    range g: 2 4 8 16
+    odr Hz: 25 50 100 200 400 800 1600
+    gyro:
+    range deg/s: 125 250 500 1000 2000
+    odr Hz: 25 50 100 200 400 800 1600 3200
+
+    lsm6
+    acce:
+    range g: 2 4 8 16
+    odr Hz: 1.6 12.5 26 52 104 208 416 833 1.66 3.33 6.66
+    gyro:
+    range deg/s: 250 500 1000 2000
+    odr Hz: 12.5 26 52 104 208 416 833 1.66 3.33 6.66
+
+     */
     info!("INIT");
     bmi088.init(&mut spi).await;
     bmi270.init(&mut spi).await;
