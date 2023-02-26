@@ -20,11 +20,9 @@ mod bmi088;
 mod bmi270;
 mod data;
 mod lsm6dsr;
+mod stepper;
 
-use bmi088::Bmi088;
-use bmi270::Bmi270;
 use data::Data;
-use lsm6dsr::Lsm6;
 
 // E13 -> LED
 
@@ -56,9 +54,9 @@ async fn read_sensors(
         embassy_stm32::peripherals::DMA1_CH3,
         embassy_stm32::peripherals::DMA1_CH2,
     >,
-    mut bmi088: Bmi088,
-    mut bmi270: Bmi270,
-    mut lsm6: Lsm6,
+    mut bmi088: bmi088::Bmi088,
+    mut bmi270: bmi270::Bmi270,
+    mut lsm6: lsm6dsr::Lsm6,
 ) {
     /*
     bmi088
@@ -119,20 +117,25 @@ async fn read_sensors(
                 gyro: bmi270.read_gyro(&mut spi).await,
             },
         ];
-
-        for (i, sensor) in data.iter().enumerate() {
-            info!(
-                "{},{},{},{},{},{},{}",
-                i,
-                sensor.gyro.data[0],
-                sensor.gyro.data[1],
-                sensor.gyro.data[2],
-                sensor.acce.data[0],
-                sensor.acce.data[1],
-                sensor.acce.data[2],
-            );
-        }
-
+        /*
+                for (i, sensor) in data.iter().enumerate() {
+                    info!(
+                        "{},{},{},{},{},{},{},{}",
+                        i,
+                        sensor.gyro.data[0],
+                        sensor.gyro.data[1],
+                        sensor.gyro.data[2],
+                        sensor.acce.data[0],
+                        sensor.acce.data[1],
+                        sensor.acce.data[2],
+                        libm::sqrtf(
+                            (sensor.acce.data[0] as i32 * sensor.acce.data[0] as i32
+                                + sensor.acce.data[1] as i32 * sensor.acce.data[1] as i32
+                                + sensor.acce.data[2] as i32 * sensor.acce.data[2] as i32) as f32
+                        ),
+                    );
+                }S1
+        */
         count += 1;
 
         if Instant::now() >= next_output {
@@ -149,6 +152,7 @@ async fn read_sensors(
     }
 }
 
+//#[embassy_executor::task]
 async fn core() {
     /*
         let mut count: u32 = 0;
@@ -171,7 +175,7 @@ async fn core() {
                 sensor.acce.data[2],
             );
         }
-        /*
+
         count += 1;
 
         if Instant::now() >= next_output {
@@ -182,7 +186,14 @@ async fn core() {
 
             count = 0;
         }
-        */
+    }
+}
+
+#[embassy_executor::task]
+async fn run_stepper(mut stepper: stepper::Stepper) {
+    loop {
+        stepper.step();
+        Timer::after(Duration::from_millis(10)).await;
     }
 }
 
@@ -214,11 +225,11 @@ async fn main(spawner: Spawner) {
     );
     //PE3 for onboard sensor
 
-    let bmi270 = Bmi270::new(Output::new(p.PB7, Level::High, Speed::Low));
+    let bmi270 = bmi270::Bmi270::new(Output::new(p.PB7, Level::High, Speed::Low));
 
-    let lsm6ds = Lsm6::new(Output::new(p.PB6, Level::High, Speed::Low));
+    let lsm6ds = lsm6dsr::Lsm6::new(Output::new(p.PB6, Level::High, Speed::Low));
 
-    let bmi088 = Bmi088::new(
+    let bmi088 = bmi088::Bmi088::new(
         Output::new(p.PB4, Level::High, Speed::Low),
         Output::new(p.PB5, Level::High, Speed::Low),
     );
@@ -227,6 +238,16 @@ async fn main(spawner: Spawner) {
     let _gyro_nss = Output::new(p.PE3, Level::High, Speed::Low);
     let gyro_interrupt = Input::new(p.PE1, Pull::Down);
     let _gyro_interrupt = ExtiInput::new(gyro_interrupt, p.EXTI1);
+
+    let stepper = stepper::Stepper::new(
+        2038,
+        Output::new(p.PD11, Level::Low, Speed::Low).degrade(),
+        Output::new(p.PB13, Level::Low, Speed::Low).degrade(),
+        Output::new(p.PB14, Level::Low, Speed::Low).degrade(),
+        Output::new(p.PB12, Level::Low, Speed::Low).degrade(),
+    );
+
+    spawner.spawn(run_stepper(stepper)).unwrap();
 
     /*
     spawner.spawn(read_sensors(spi, bmi088, bmi270, lsm6ds)).unwrap();

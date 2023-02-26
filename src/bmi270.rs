@@ -8238,7 +8238,7 @@ impl Bmi270 {
         self.cs.set_high();
         info!("bmi270 WHOAMI {} (36)", buf[2]);
 
-        //// init sequence as per page 18
+        //// START: init sequence as per page 18
 
         let buf: [u8; 2] = [0x7C | WRITE, 0x00];
         self.cs.set_low();
@@ -8261,6 +8261,8 @@ impl Bmi270 {
         spi.blocking_write(&buf).ok();
         self.cs.set_high();
 
+        //// END: init sequence as per page 18
+
         Timer::after(Duration::from_millis(20)).await;
 
         let mut buf: [u8; 3] = [0x21 | READ, 0xFF, 0xFF];
@@ -8269,21 +8271,37 @@ impl Bmi270 {
         self.cs.set_high();
         info!("bmi270 init status {} (0x01)", buf[2]);
 
+        // TURN ON
         let buf: [u8; 2] = [0x7D | WRITE, 0x0E];
         self.cs.set_low();
         spi.blocking_write(&buf).ok();
         self.cs.set_high();
 
-        let buf: [u8; 2] = [0x40 | WRITE, 0xA8];
+        // perfomance, no avg, 800Hz odr
+        let buf: [u8; 2] = [0x40 | WRITE, 0x8B];
         self.cs.set_low();
         spi.blocking_write(&buf).ok();
         self.cs.set_high();
 
-        let buf: [u8; 2] = [0x42 | WRITE, 0xE9];
+        // +-4g
+        let buf: [u8; 2] = [0x41 | WRITE, 0x01];
         self.cs.set_low();
         spi.blocking_write(&buf).ok();
         self.cs.set_high();
 
+        // perfomance mode, 800Hz odr
+        let buf: [u8; 2] = [0x42 | WRITE, 0xEB];
+        self.cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.cs.set_high();
+
+        // +-500deg
+        let buf: [u8; 2] = [0x43 | WRITE, 0x02];
+        self.cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.cs.set_high();
+
+        // TURN ON
         let buf: [u8; 2] = [0x7C | WRITE, 0x02];
         self.cs.set_low();
         spi.blocking_write(&buf).ok();

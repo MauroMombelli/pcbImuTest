@@ -8,6 +8,16 @@ use super::data::Data;
 const WRITE: u8 = 0 << 7;
 const READ: u8 = 1 << 7;
 
+/*
+bmi088
+    acce:
+    range g: 3 6 12 24
+    odr Hz: 12.5 25 50 100 200 400 800 1600
+    gyro:
+    range deg/s: 125 250 500 1000 2000
+    odr Hz: 100 200 400 1000 2000
+ */
+
 pub struct Bmi088 {
     gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
     acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
@@ -57,7 +67,7 @@ impl Bmi088 {
         self.acce_cs.set_high();
 
         // 0x00 ACC_CHIP_ID == 0x1E
-        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
+        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF];
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
@@ -65,9 +75,17 @@ impl Bmi088 {
 
         // 0x03: ACC_STATUS bit7 == data ready, 6:0 reserved
 
-        // 0x40: ACC_CONF 7:4 badwith, keep default 0x0A 3:0 ODR 0x0B = 800Hz 0x0C = 1600Hz
+        // 0x40: ACC_CONF 7:4 bandwith, keep default 0x0A 3:0 ODR 0x0B = 800Hz 0x0C = 1600Hz
+        let mut buf: [u8; 2] = [0x40 | WRITE, 0x0B];
+        self.acce_cs.set_low();
+        spi.blocking_write(&mut buf).ok();
+        self.acce_cs.set_high();
 
         // 0x41: ACC_RANGE 1:0 0x00 = +-3g 0x01 +-6g (default)
+        let mut buf: [u8; 2] = [0x41 | WRITE, 0x00];
+        self.acce_cs.set_low();
+        spi.blocking_write(&mut buf).ok();
+        self.acce_cs.set_high();
 
         // 0x58: INT1_INT2_MAP_DATA bit 6 drdy on INT2, bit 2 drdy on INT1
 
@@ -85,7 +103,7 @@ impl Bmi088 {
         info!("acce ACC_PWR_CONF {} (0)", buf[2]);
 
         // 0x7D: ACC_PWR_CTRL 0x00 off (default) 0x04 on
-        let buf: [u8; 2] = [0x7D | WRITE, 0x04]; // turn on
+        let buf: [u8; 2] = [0x7D | WRITE, 0x04];
         self.acce_cs.set_low();
         spi.blocking_write(&buf).ok();
         self.acce_cs.set_high();
@@ -99,7 +117,7 @@ impl Bmi088 {
         info!("acce ACC_PWR_CTRL {} (4)", buf[2]);
 
         Timer::after(Duration::from_millis(100)).await;
-        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF]; // turn on
+        let mut buf: [u8; 3] = [0x00 | READ, 0xFF, 0xFF];
         self.acce_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.acce_cs.set_high();
@@ -109,7 +127,7 @@ impl Bmi088 {
 
         // 0x00: GYRO_CHIP_ID = 0x0F
 
-        let mut buf: [u8; 2] = [0x00 | READ, 0x00]; // turn on
+        let mut buf: [u8; 2] = [0x00 | READ, 0x00];
         self.gyro_cs.set_low();
         spi.blocking_transfer_in_place(&mut buf).ok();
         self.gyro_cs.set_high();
@@ -117,11 +135,19 @@ impl Bmi088 {
 
         // 0x02 – 0x07: Rate data
 
+        // 0x0F: GYRO_RANGE 0x00 +-2000deg/s (default) 0x02 = +-500 deg/s
+        let buf: [u8; 2] = [0x0F | WRITE, 0x02];
+        self.gyro_cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.gyro_cs.set_high();
+
         // 0x10: GYRO_BANDWIDTH 0x00 2000Hz 532Hz BW (default) 0x02 1000Hz 116Hz BW
+        let buf: [u8; 2] = [0x10 | WRITE, 0x02];
+        self.gyro_cs.set_low();
+        spi.blocking_write(&buf).ok();
+        self.gyro_cs.set_high();
 
         // 0x15: GYRO_INT_CTRL bit7 enable data ready int
-
-        // 0x0F: GYRO_RANGE 0x00 +-2000deg/s (default) 0x02 = +-500 deg/s
     }
 
     pub async fn read_acce<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
