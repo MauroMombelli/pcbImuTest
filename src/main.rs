@@ -117,25 +117,25 @@ async fn read_sensors(
                 gyro: bmi270.read_gyro(&mut spi).await,
             },
         ];
-        /*
-                for (i, sensor) in data.iter().enumerate() {
-                    info!(
-                        "{},{},{},{},{},{},{},{}",
-                        i,
-                        sensor.gyro.data[0],
-                        sensor.gyro.data[1],
-                        sensor.gyro.data[2],
-                        sensor.acce.data[0],
-                        sensor.acce.data[1],
-                        sensor.acce.data[2],
-                        libm::sqrtf(
-                            (sensor.acce.data[0] as i32 * sensor.acce.data[0] as i32
-                                + sensor.acce.data[1] as i32 * sensor.acce.data[1] as i32
-                                + sensor.acce.data[2] as i32 * sensor.acce.data[2] as i32) as f32
-                        ),
-                    );
-                }S1
-        */
+
+        for (i, sensor) in data.iter().enumerate() {
+            info!(
+                "{},{},{},{},{},{},{},{}",
+                i,
+                sensor.gyro.data[0],
+                sensor.gyro.data[1],
+                sensor.gyro.data[2],
+                sensor.acce.data[0],
+                sensor.acce.data[1],
+                sensor.acce.data[2],
+                libm::sqrtf(
+                    (sensor.acce.data[0] as i32 * sensor.acce.data[0] as i32
+                        + sensor.acce.data[1] as i32 * sensor.acce.data[1] as i32
+                        + sensor.acce.data[2] as i32 * sensor.acce.data[2] as i32) as f32
+                ),
+            );
+        }
+
         count += 1;
 
         if Instant::now() >= next_output {
@@ -175,7 +175,7 @@ async fn core() {
                 sensor.acce.data[2],
             );
         }
-
+        /*
         count += 1;
 
         if Instant::now() >= next_output {
@@ -186,6 +186,7 @@ async fn core() {
 
             count = 0;
         }
+        */
     }
 }
 
