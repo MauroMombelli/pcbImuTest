@@ -1,6 +1,6 @@
 use defmt::*;
 use embassy_stm32::gpio::Output;
-use embassy_stm32::spi::{Instance, Spi};
+use embassy_stm32::spi::{Instance, RxDma, Spi, TxDma};
 use embassy_time::{Duration, Instant, Timer};
 
 use super::data::Data;
@@ -18,6 +18,8 @@ bmi088
     odr Hz: 100 200 400 1000 2000
  */
 
+const TRANSLATION_FACTOR_ACCE: f32 = 6.0 / i16::MAX as f32;
+const TRANSLATION_FACTOR_GYRO: f32 = 1.0; //500.0 / i16::MAX as f32; //500deg/s
 pub struct Bmi088 {
     gyro_cs: Output<'static, embassy_stm32::peripherals::PB4>,
     acce_cs: Output<'static, embassy_stm32::peripherals::PB5>,
@@ -150,7 +152,11 @@ impl Bmi088 {
         // 0x15: GYRO_INT_CTRL bit7 enable data ready int
     }
 
-    pub async fn read_acce<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
+    pub async fn read_acce<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data
+    where
+        Tx: TxDma<T>,
+        Rx: RxDma<T>,
+    {
         // 0x12 – 0x17: ACC data, X, Y, Z
         /*
         Accel_X_int16 = ACC_X_MSB * 256 + ACC_X_LSB
@@ -163,19 +169,23 @@ impl Bmi088 {
         */
         let mut read: [u8; 8] = [0x12 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         self.acce_cs.set_low();
-        spi.blocking_transfer_in_place(&mut read).ok();
+        spi.transfer_in_place(&mut read).await.ok();
         self.acce_cs.set_high();
 
         Data {
             data: [
-                (read[2] as u16 + (read[3] as u16 * 256)) as i16,
-                (read[4] as u16 + (read[5] as u16 * 256)) as i16,
-                (read[6] as u16 + (read[7] as u16 * 256)) as i16,
+                i16::from_ne_bytes([read[2], read[3]]) as f32 * TRANSLATION_FACTOR_ACCE,
+                i16::from_ne_bytes([read[4], read[5]]) as f32 * TRANSLATION_FACTOR_ACCE,
+                i16::from_ne_bytes([read[6], read[7]]) as f32 * TRANSLATION_FACTOR_ACCE,
             ],
         }
     }
 
-    pub async fn read_gyro<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
+    pub async fn read_gyro<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data
+    where
+        Tx: TxDma<T>,
+        Rx: RxDma<T>,
+    {
         // 0x02 – 0x07: Rate data X, Y, Z
         /*
         Rate_X: RATE_X_MSB * 256 + RATE_X_LSB
@@ -184,15 +194,62 @@ impl Bmi088 {
          */
         let mut read: [u8; 7] = [0x02 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         self.gyro_cs.set_low();
-        spi.blocking_transfer_in_place(&mut read).ok();
+        spi.transfer_in_place(&mut read).await.ok();
         self.gyro_cs.set_high();
 
         Data {
             data: [
-                (read[1] as u16 + (read[2] as u16 * 256)) as i16,
-                (read[3] as u16 + (read[4] as u16 * 256)) as i16,
-                (read[5] as u16 + (read[6] as u16 * 256)) as i16,
+                i16::from_ne_bytes([read[1], read[2]]) as f32 * TRANSLATION_FACTOR_GYRO,
+                i16::from_ne_bytes([read[3], read[4]]) as f32 * TRANSLATION_FACTOR_GYRO,
+                i16::from_ne_bytes([read[5], read[6]]) as f32 * TRANSLATION_FACTOR_GYRO,
             ],
         }
     }
+    /*
+        pub fn read_acce_blocking<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
+            // 0x12 – 0x17: ACC data, X, Y, Z
+            /*
+            Accel_X_int16 = ACC_X_MSB * 256 + ACC_X_LSB
+            Accel_Y_int16 = ACC_Y_MSB * 256 + ACC_Y_LSB
+            Accel_Z_int16 = ACC_Z_MSB * 256 + ACC_Z_LSB
+
+            Accel_X_in_mg = Accel_X_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+            Accel_Y_in_mg = Accel_Y_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+            Accel_Z_in_mg = Accel_Z_int16 / 32768 * 1000 * 2^(<0x41> + 1) * 1.5
+            */
+            let mut read: [u8; 8] = [0x12 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            self.acce_cs.set_low();
+            spi.blocking_transfer_in_place(&mut read).ok();
+            self.acce_cs.set_high();
+
+            Data {
+                data: [
+                    (read[2] as u16 + (read[3] as u16 * 256)) as i16,
+                    (read[4] as u16 + (read[5] as u16 * 256)) as i16,
+                    (read[6] as u16 + (read[7] as u16 * 256)) as i16,
+                ],
+            }
+        }
+
+        pub fn read_gyro_blocking<T: Instance, Tx, Rx>(&mut self, spi: &mut Spi<'_, T, Tx, Rx>) -> Data {
+            // 0x02 – 0x07: Rate data X, Y, Z
+            /*
+            Rate_X: RATE_X_MSB * 256 + RATE_X_LSB
+            Rate_Y: RATE_Y_MSB * 256 + RATE_Y_LSB
+            Rate_Z: RATE_Z_MSB * 256 + RATE_Z_LSB
+             */
+            let mut read: [u8; 7] = [0x02 | READ, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+            self.gyro_cs.set_low();
+            spi.blocking_transfer_in_place(&mut read).ok();
+            self.gyro_cs.set_high();
+
+            Data {
+                data: [
+                    (read[1] as u16 + (read[2] as u16 * 256)) as i16,
+                    (read[3] as u16 + (read[4] as u16 * 256)) as i16,
+                    (read[5] as u16 + (read[6] as u16 * 256)) as i16,
+                ],
+            }
+        }
+    */
 }

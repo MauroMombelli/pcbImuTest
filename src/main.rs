@@ -4,16 +4,17 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
+use ahrs::{Ahrs, Madgwick};
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::exti::ExtiInput;
 use embassy_stm32::gpio::{Input, Level, Output, Pull, Speed};
-use embassy_stm32::interrupt;
 use embassy_stm32::spi::Spi;
 use embassy_stm32::time::Hertz;
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
+use nalgebra::Vector3;
 use {defmt_rtt as _, panic_probe as _};
 
 //mod drivers::bmi088;
@@ -23,7 +24,7 @@ mod actuators;
 mod sensors;
 
 use actuators::stepper;
-use sensors::data::Data;
+use sensors::data::Imu;
 use sensors::{bmi088, bmi270, lsm6dsr};
 
 // E13 -> LED
@@ -34,19 +35,12 @@ use sensors::{bmi088, bmi270, lsm6dsr};
 // gyro: spi, l3gd20
 // A5 A6 A7 -> SPI
 // E3 -> CS
-struct Imu {
-    acce: Data,
-    gyro: Data,
-}
-/*
-static LSM6: Signal<ThreadModeRawMutex, Imu> = Signal::new();
-static BMI270: Signal<ThreadModeRawMutex, Imu> = Signal::new();
-static BMI088: Signal<ThreadModeRawMutex, Imu> = Signal::new();
-*/
+
 static SENSORS_DATA: Signal<ThreadModeRawMutex, [Imu; 3]> = Signal::new();
 
 static READ_SENSOR_LOOP_S: AtomicU32 = AtomicU32::new(0);
 static CORE_UPDATE: AtomicU32 = AtomicU32::new(0);
+static SLEEP_UPDATE: AtomicU32 = AtomicU32::new(0);
 
 #[embassy_executor::task]
 async fn read_sensors(
@@ -96,94 +90,99 @@ async fn read_sensors(
     let mut time_start_next_loop = Instant::now();
     let loop_desired_duration = Duration::from_millis(1);
 
-    let mut count: u32 = 0;
-
-    let output_delay = Duration::from_secs(1);
-    let mut next_output = Instant::now() + output_delay;
-
     loop {
         time_start_next_loop += loop_desired_duration;
         Timer::at(time_start_next_loop).await;
 
-        let data: [Imu; 3] = [
-            Imu {
-                acce: lsm6.read_acce(&mut spi).await,
-                gyro: lsm6.read_gyro(&mut spi).await,
-            },
+        let mut data: [Imu; 3] = [
+            lsm6.read_imu(&mut spi).await,
             Imu {
                 acce: bmi088.read_acce(&mut spi).await,
                 gyro: bmi088.read_gyro(&mut spi).await,
             },
-            Imu {
-                acce: bmi270.read_acce(&mut spi).await,
-                gyro: bmi270.read_gyro(&mut spi).await,
-            },
+            bmi270.read_imu(&mut spi).await,
         ];
-        /*
-                for (i, sensor) in data.iter().enumerate() {
-                    info!(
-                        "{},{},{},{},{},{},{}",
-                        i,
-                        sensor.gyro.data[0],
-                        sensor.gyro.data[1],
-                        sensor.gyro.data[2],
-                        sensor.acce.data[0],
-                        sensor.acce.data[1],
-                        sensor.acce.data[2],
-                    );
-                }
-        */
-        count += 1;
 
-        if Instant::now() >= next_output {
-            next_output += output_delay;
+        //from sensor axis to body axis lsm6
+        // no changes
 
-            info!("loop/s: {}", count);
+        //from sensor axis to body axis bmi088
+        let tmp = data[1].acce.data[0];
+        data[1].acce.data[0] = -data[1].acce.data[1];
+        data[1].acce.data[1] = tmp;
+        let tmp = data[1].gyro.data[0];
+        data[1].gyro.data[0] = -data[1].gyro.data[1];
+        data[1].gyro.data[1] = tmp;
 
-            count = 0;
-        }
-        /*
+        //from sensor axis to body axis
+        data[2].acce.data[0] *= -1.0;
+        data[2].acce.data[1] *= -1.0;
+        data[2].gyro.data[0] *= -1.0;
+        data[2].gyro.data[1] *= -1.0;
+
         SENSORS_DATA.signal(data);
         READ_SENSOR_LOOP_S.fetch_add(1, Ordering::SeqCst);
-        */
     }
 }
 
 #[embassy_executor::task]
-async fn core() {
-    let mut count: u32 = 0;
-
-    let output_delay = Duration::from_secs(1);
+async fn flight_controller() {
+    let output_delay = Duration::from_millis(100);
     let mut next_output = Instant::now() + output_delay;
 
+    let mut ahrs = [
+        Madgwick::new((1.0f32) / (256.0), 0.1f32),
+        Madgwick::new((1.0f32) / (256.0), 0.1f32),
+        Madgwick::new((1.0f32) / (256.0), 0.1f32),
+    ];
+
+    let mut stupid_int_x: [f32; 3] = [0.0, 0.0, 0.0];
+    let mut stupid_int_y: [f32; 3] = [0.0, 0.0, 0.0];
+    let mut stupid_int_z: [f32; 3] = [0.0, 0.0, 0.0];
     loop {
         let sensors = SENSORS_DATA.wait().await;
-        /*
-                for (i, sensor) in sensors.iter().enumerate() {
-                    info!(
-                        "{},{},{},{},{},{},{}",
-                        i,
-                        sensor.gyro.data[0],
-                        sensor.gyro.data[1],
-                        sensor.gyro.data[2],
-                        sensor.acce.data[0],
-                        sensor.acce.data[1],
-                        sensor.acce.data[2],
-                    );
+
+        for (i, sensor) in sensors.iter().enumerate() {
+            let gyroscope = Vector3::new(sensor.gyro.data[0], sensor.gyro.data[1], sensor.gyro.data[2]);
+            let accelerometer = Vector3::new(sensor.acce.data[0], sensor.acce.data[1], sensor.acce.data[2]);
+            let quat = ahrs[i].update_imu(&gyroscope, &accelerometer);
+            /* if Instant::now() >= next_output {
+                if let Some(quat) = quat.ok() {
+                    let (roll, pitch, yaw) = quat.euler_angles();
+                    println!("sensor={} pitch={}, roll={}, yaw={}", i, pitch, roll, yaw);
                 }
-        */
-        count += 1;
+            } */
+            stupid_int_x[i] += sensor.gyro.data[0];
+            stupid_int_y[i] += sensor.gyro.data[1];
+            stupid_int_z[i] += sensor.gyro.data[2];
+        }
 
         if Instant::now() >= next_output {
             next_output += output_delay;
+            for (i, sensor) in sensors.iter().enumerate() {
+                println!(
+                    "sensor={} ({}, {}, {}) ({}, {}, {})",
+                    i,
+                    sensor.gyro.data[0],
+                    sensor.gyro.data[1],
+                    sensor.gyro.data[2],
+                    sensor.acce.data[0],
+                    sensor.acce.data[1],
+                    sensor.acce.data[2],
+                );
+            }
+        }
 
-            let read_sensors = READ_SENSOR_LOOP_S.swap(0, Ordering::SeqCst);
-            info!(
-                "loop/s: {} read_sensors: {} random sensors: {}",
-                count, read_sensors, sensors[0].gyro.data[0]
-            );
+        CORE_UPDATE.fetch_add(1, Ordering::SeqCst);
+    }
+}
 
-            count = 0;
+#[embassy_executor::task]
+async fn free_cpu_count() {
+    loop {
+        embassy_futures::yield_now().await;
+        for i in 1..100 {
+            SLEEP_UPDATE.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -222,6 +221,7 @@ async fn main(spawner: Spawner) {
         Hertz(10_000_000),
         embassy_stm32::spi::Config::default(),
     );
+
     //PE3 for onboard sensor
 
     let bmi270 = bmi270::Bmi270::new(Output::new(p.PB7, Level::High, Speed::Low));
@@ -249,14 +249,33 @@ async fn main(spawner: Spawner) {
         spawner.spawn(run_stepper(stepper)).unwrap();
     */
 
-    spawner.spawn(read_sensors(spi, bmi088, bmi270, lsm6ds)).unwrap();
+    spawner.spawn(free_cpu_count()).unwrap();
 
-    spawner.spawn(core()).unwrap();
+    spawner.spawn(flight_controller()).unwrap();
+
+    spawner.spawn(read_sensors(spi, bmi088, bmi270, lsm6ds)).unwrap();
 
     loop {
         Timer::after(Duration::from_secs(1)).await;
         let read_update = READ_SENSOR_LOOP_S.swap(0, Ordering::SeqCst);
         let core_update = CORE_UPDATE.swap(0, Ordering::SeqCst);
-        info!("read_sensor/s: {} core/s: {}", read_update, core_update);
+        let sleep_update = SLEEP_UPDATE.swap(0, Ordering::SeqCst);
+        info!(
+            "read_sensor/s: {} core/s: {} sleep_update/s: {}",
+            read_update, core_update, sleep_update
+        );
     }
+
+    /* let output_delay = Duration::from_secs(1);
+    let mut next_output = Instant::now() + output_delay;
+    let mut count = 0;
+    loop {
+        count += 1;
+
+        if Instant::now() >= next_output {
+            next_output += output_delay;
+            info!("loop/s: {}", CORE_UPDATE.swap(0, Ordering::SeqCst));
+            count = 0;
+        }
+    } */
 }
